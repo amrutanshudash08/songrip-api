@@ -2,11 +2,17 @@ import os
 import re
 import json
 import requests
-from urllib.parse import urlparse, urlunparse, parse_qs
+from urllib.parse import urlparse, urlunparse, parse_qs, quote
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
 
 def clean_url(raw):
     m = re.search(r'https?://\S+', raw)
@@ -18,25 +24,43 @@ def clean_url(raw):
     path = path.replace('/sing-recording/', '/recording/')
     return urlunparse(p._replace(path=path, query='', fragment=''))
 
-def find_audio_in_text(text):
-    """Search for audio CDN URLs in any text/JSON blob."""
+def find_smule_cdn(text):
+    """Find *.cdn.smule.com audio URLs in any text blob."""
+    # Look for audio CDN URLs (updated pattern per community fix)
     patterns = [
-        r'"media_url"\s*:\s*"([^"]+)"',
-        r'"(https://[^"]+smule[^"]+\.(?:m4a|mp4|aac|mp3)(?:\?[^"]*)?)"',
-        r'"(https://feed\.smule\.com[^"]+)"',
-        r'"(https://[^"]+\.(?:m4a|mp4|aac|mp3)(?:\?[^"]*)?)"',
+        r'https://[a-z0-9\-]+\.cdn\.smule\.com/[^\s"\'<>]+\.m4a(?:\?[^\s"\'<>]*)?',
+        r'https://[a-z0-9\-]+\.cdn\.smule\.com/[^\s"\'<>]+\.mp4(?:\?[^\s"\'<>]*)?',
+        r'https://feed\.smule\.com/[^\s"\'<>]+\.m4a(?:\?[^\s"\'<>]*)?',
+        r'https://feed\.smule\.com/[^\s"\'<>]+\.mp4(?:\?[^\s"\'<>]*)?',
     ]
     for pattern in patterns:
         m = re.search(pattern, text)
         if m:
-            url = m.group(1)
-            # Skip if it looks like a thumbnail or image
-            if any(x in url for x in ['thumb', 'cover', 'pic', 'avatar', 'image']):
-                continue
-            return url
+            return m.group(0).rstrip('\\')
     return None
 
-def extract_smule(url):
+def try_sownloader_api(url):
+    """Try the old sownloader.com API endpoint — still works for many recordings."""
+    try:
+        resp = requests.get(
+            f'https://sownloader.com/index.php?url={quote(url, safe="")}',
+            headers=HEADERS,
+            timeout=20
+        )
+        if resp.ok and 'cdn.smule.com' in resp.text:
+            audio = find_smule_cdn(resp.text)
+            if audio:
+                # Try to get title from the page
+                title_match = re.search(r'<title>([^<]+)</title>', resp.text, re.I)
+                title = title_match.group(1) if title_match else 'recording'
+                title = re.sub(r'\s*[-|]\s*Sownloader.*$', '', title, flags=re.I).strip()
+                return audio, title
+    except Exception:
+        pass
+    return None, None
+
+def try_playwright(url):
+    """Fallback: use Playwright to render the page and intercept the CDN URL."""
     audio_url = None
     title = 'recording'
 
@@ -46,65 +70,55 @@ def extract_smule(url):
             args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
         )
         context = browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            user_agent=HEADERS['User-Agent'],
             viewport={'width': 1280, 'height': 720},
         )
         page = context.new_page()
 
-        # Intercept audio CDN responses in the background
         def on_response(response):
             nonlocal audio_url
             u = response.url
-            if not audio_url and any(ext in u for ext in ['.m4a', '.mp4', '.aac', '.mp3']):
-                if not any(x in u for x in ['thumb', 'cover', 'pic', 'avatar']):
-                    audio_url = u
+            if not audio_url and 'cdn.smule.com' in u and any(ext in u for ext in ['.m4a', '.mp4']):
+                audio_url = u
+            if not audio_url and 'feed.smule.com' in u and any(ext in u for ext in ['.m4a', '.mp4']):
+                audio_url = u
 
         page.on('response', on_response)
 
         try:
-            # Use 'commit' — returns as soon as first byte received, very fast
             page.goto(url, wait_until='commit', timeout=20000)
-
-            # Wait a few seconds for SSR HTML + any audio requests
-            page.wait_for_timeout(4000)
-
-            content = page.content()
+            page.wait_for_timeout(5000)
             title = page.title() or 'recording'
 
-            # Parse __NEXT_DATA__ — Smule uses Next.js so audio URL is SSR'd into the page
             if not audio_url:
-                next_data = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', content)
-                if next_data:
-                    try:
-                        data = json.loads(next_data.group(1))
-                        s = json.dumps(data)
-                        audio_url = find_audio_in_text(s)
+                content = page.content()
+                audio_url = find_smule_cdn(content)
 
-                        # Also try to get a better title from the JSON
-                        title_match = re.search(r'"title"\s*:\s*"([^"]{5,100})"', s)
-                        if title_match:
-                            title = title_match.group(1)
-                    except Exception:
-                        pass
-
-            # Fallback: search raw HTML
-            if not audio_url:
-                audio_url = find_audio_in_text(content)
-
-            # Fallback: og:audio meta tag
-            if not audio_url:
-                og = re.search(r'property="og:audio(?::url)?"\s+content="([^"]+)"', content)
-                if og:
-                    audio_url = og.group(1)
-
+                # Also check __NEXT_DATA__
+                if not audio_url:
+                    nd = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', content)
+                    if nd:
+                        try:
+                            audio_url = find_smule_cdn(json.dumps(json.loads(nd.group(1))))
+                        except Exception:
+                            pass
         finally:
             browser.close()
 
-    if not audio_url:
-        raise Exception('Could not find audio. The recording may be private or Smule is blocking access.')
+    return audio_url, title
 
-    ext = re.search(r'\.(m4a|mp4|aac|mp3)', audio_url)
-    ext = ext.group(1) if ext else 'm4a'
+def extract_smule(url):
+    # Strategy 1: Sownloader API (fast, no Playwright needed)
+    audio_url, title = try_sownloader_api(url)
+
+    # Strategy 2: Playwright fallback
+    if not audio_url:
+        audio_url, title = try_playwright(url)
+
+    if not audio_url:
+        raise Exception('Could not extract audio from Smule. The recording may be private.')
+
+    ext = 'm4a' if '.m4a' in audio_url else 'mp4'
     safe_title = re.sub(r'[^\w\s\-()]', '', title).strip()[:80] or 'recording'
     return audio_url, safe_title, ext
 
@@ -117,8 +131,7 @@ def extract_starmaker(url):
 
     resp = requests.get(
         f'https://www.starmakerstudios.com/api/social/recording/info?recordingId={recording_id}',
-        headers={'User-Agent': 'Mozilla/5.0'},
-        timeout=15
+        headers={'User-Agent': 'Mozilla/5.0'}, timeout=15
     )
     if not resp.ok:
         raise Exception(f'StarMaker API error ({resp.status_code})')
@@ -140,8 +153,7 @@ def extract_starmaker(url):
 
     ext = re.search(r'\.(m4a|mp4|aac|mp3)', audio_url)
     ext = ext.group(1) if ext else 'm4a'
-    safe_title = re.sub(r'[^\w\s\-()]', '', title).strip()[:80] or 'recording'
-    return audio_url, safe_title, ext
+    return audio_url, re.sub(r'[^\w\s\-()]', '', title).strip()[:80] or 'recording', ext
 
 @app.route('/')
 def index():
