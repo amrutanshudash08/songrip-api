@@ -8,16 +8,14 @@ app = Flask(__name__)
 ALLOWED = ["smule.com", "starmakerstudios.com", "starmaker.us", "yokee.com", "singsnap.com"]
 
 def clean_url(raw):
-    # Extract URL from share message text
     m = re.search(r'https?://\S+', raw)
     if not m:
         return None
     url = m.group(0).rstrip("'\".,)")
-
-    # Parse and strip junk
     p = urlparse(url)
-    # Remove social suffixes and UTM params
     path = re.sub(r'/(twitter|facebook|instagram|whatsapp|copy|embed|frame|box)(/.*)?$', '', p.path)
+    # Normalize smule URL format
+    path = path.replace('/sing-recording/', '/recording/')
     return urlunparse(p._replace(path=path, query='', fragment=''))
 
 @app.route('/')
