@@ -71,19 +71,15 @@ def extract_smule(url):
     return audio_url, safe_title, ext
 
 def extract_starmaker(url):
-    p = urlparse(url)
-    params = dict(pair.split('=', 1) for pair in p.query.split('&') if '=' in pair)
-    recording_id = params.get('recordingId')
+    # Use URLSearchParams-style parsing to handle complex query strings
+    parsed = urlparse(url)
+    # Handle both ? and & separated params
+    from urllib.parse import parse_qs
+    params = parse_qs(parsed.query)
+    recording_id = (params.get('recordingId') or [''])[0]
+    
     if not recording_id:
         raise Exception('Could not find recording ID in StarMaker link.')
-
-    resp = requests.get(
-        f'https://www.starmakerstudios.com/api/social/recording/info?recordingId={recording_id}',
-        headers={'User-Agent': 'Mozilla/5.0'},
-        timeout=15
-    )
-    if not resp.ok:
-        raise Exception(f'StarMaker API error ({resp.status_code})')
 
     data = resp.json()
     s = json.dumps(data)
