@@ -50,6 +50,8 @@ def rip():
             'quiet': True,
             'noplaylist': True,
             'skip_download': True,
+            # Impersonate Chrome to bypass Cloudflare
+            'impersonate': 'chrome',
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
