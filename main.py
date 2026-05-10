@@ -1,18 +1,15 @@
 import os
 import re
+import json
 from urllib.parse import urlparse, urlunparse
 from flask import Flask, request, jsonify
-import yt_dlp
+import cloudscraper
 
 app = Flask(__name__)
 
-ALLOWED = [
-    "smule.com",
-    "starmakerstudios.com",
-    "starmaker.us",
-    "yokee.com",
-    "singsnap.com",
-]
+SCRAPER = cloudscraper.create_scraper(
+    browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
+)
 
 def clean_url(raw):
     m = re.search(r'https?://\S+', raw)
@@ -24,24 +21,123 @@ def clean_url(raw):
     path = path.replace('/sing-recording/', '/recording/')
     return urlunparse(p._replace(path=path, query='', fragment=''))
 
-def try_extract(url, impersonate=None):
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'quiet': True,
-        'noplaylist': True,
-        'skip_download': True,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.smule.com/',
-        },
-    }
-    if impersonate:
-        ydl_opts['impersonate'] = impersonate
+def extract_smule(url):
+    resp = SCRAPER.get(url, timeout=30)
+    resp.raise_for_status()
+    html = resp.text
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    # Title from og:title
+    title = 'recording'
+    og_title = re.search(r'property="og:title"\s+content="([^"]+)"', html)
+    if og_title:
+        title = og_title.group(1)
+
+    audio_url = None
+
+    # Strategy 1: __NEXT_DATA__ JSON blob
+    next_data = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', html)
+    if next_data:
+        try:
+            s = json.dumps(json.loads(next_data.group(1)))
+            for pattern in [
+                r'"media_url"\s*:\s*"([^"]+)"',
+                r'"(https://[^"]+smule[^"]+\.(?:m4a|mp4|aac|mp3)(?:\?[^"]*)?)"',
+                r'"(https://storage\.googleapis[^"]+\.(?:m4a|mp4|aac|mp3)(?:\?[^"]*)?)"',
+                r'"(https://[^"]+\.(?:m4a|mp4|aac|mp3)(?:\?[^"]*)?)"',
+            ]:
+                m = re.search(pattern, s)
+                if m:
+                    audio_url = m.group(1)
+                    break
+        except Exception:
+            pass
+
+    # Strategy 2: og:audio meta tag
+    if not audio_url:
+        m = re.search(r'property="og:audio(?::url)?"\s+content="([^"]+)"', html)
+        if m:
+            audio_url = m.group(1)
+
+    # Strategy 3: og:video
+    if not audio_url:
+        m = re.search(r'property="og:video(?::url)?"\s+content="([^"]+)"', html)
+        if m and '/frame' not in m.group(1):
+            audio_url = m.group(1)
+
+    # Strategy 4: raw audio URL anywhere in page
+    if not audio_url:
+        m = re.search(r'https://[^\s"\'<>]+\.(?:m4a|mp4|aac|mp3)(?:\?[^\s"\'<>]*)?', html)
+        if m:
+            audio_url = m.group(0)
+
+    # Strategy 5: hit Smule API directly using recording ID
+    if not audio_url:
+        ids = re.search(r'(\d+_\d+)', url)
+        if ids:
+            try:
+                api = SCRAPER.get(
+                    f'https://www.smule.com/api/v0/performances/{ids.group(1)}',
+                    timeout=15
+                )
+                if api.ok:
+                    data = api.json()
+                    audio_url = (
+                        data.get('media_url') or
+                        data.get('data', {}).get('media_url') or
+                        data.get('performance', {}).get('media_url')
+                    )
+                    if not audio_url:
+                        s = json.dumps(data)
+                        m = re.search(r'"(https://[^"]+\.(?:m4a|mp4|aac|mp3)(?:\?[^"]*)?)"', s)
+                        if m:
+                            audio_url = m.group(1)
+            except Exception:
+                pass
+
+    if not audio_url:
+        raise Exception('Could not find audio in this Smule page.')
+
+    ext = re.search(r'\.(m4a|mp4|aac|mp3)', audio_url)
+    ext = ext.group(1) if ext else 'm4a'
+    return audio_url, title, ext
+
+def extract_starmaker(url):
+    p = urlparse(url)
+    recording_id = dict(pair.split('=', 1) for pair in p.query.split('&') if '=' in pair).get('recordingId')
+    if not recording_id:
+        raise Exception('Could not find recording ID in StarMaker link.')
+
+    resp = SCRAPER.get(
+        f'https://www.starmakerstudios.com/api/social/recording/info?recordingId={recording_id}',
+        timeout=15
+    )
+    if not resp.ok:
+        raise Exception(f'StarMaker API error ({resp.status_code})')
+
+    data = resp.json()
+    s = json.dumps(data)
+
+    title = (
+        data.get('data', {}).get('recordingName') or
+        data.get('data', {}).get('name') or
+        'recording'
+    )
+    audio_url = (
+        data.get('data', {}).get('recordingUrl') or
+        data.get('data', {}).get('audioUrl') or
+        data.get('data', {}).get('mediaUrl')
+    )
+    if not audio_url:
+        m = re.search(r'"(https://[^"]+\.(?:m4a|mp4|aac|mp3)(?:\?[^"]*)?)"', s)
+        if m:
+            audio_url = m.group(1)
+
+    if not audio_url:
+        raise Exception('Could not extract audio from StarMaker.')
+
+    ext = re.search(r'\.(m4a|mp4|aac|mp3)', audio_url)
+    ext = ext.group(1) if ext else 'm4a'
+    return audio_url, title, ext
 
 @app.route('/')
 def index():
@@ -58,43 +154,18 @@ def rip():
     url = clean_url(request.json.get('url', ''))
 
     if not url:
-        return jsonify(error='No URL found.'), 400
-
-    if not any(d in url for d in ALLOWED):
-        return jsonify(error='Unsupported platform.'), 400
+        return jsonify(error='No URL found in the text you pasted.'), 400
 
     try:
-        # Try with different impersonation targets in order
-        info = None
-        last_error = None
-        for target in [None, 'chrome-124', 'chrome-116', 'safari', 'chrome']:
-            try:
-                info = try_extract(url, impersonate=target)
-                break
-            except Exception as e:
-                last_error = e
-                continue
+        if 'smule.com' in url:
+            audio_url, title, ext = extract_smule(url)
+        elif 'starmaker' in url:
+            audio_url, title, ext = extract_starmaker(url)
+        else:
+            return jsonify(error='Unsupported platform. Use Smule or StarMaker.'), 400
 
-        if info is None:
-            raise last_error
-
-        audio_url = info.get('url')
-        ext = info.get('ext', 'm4a')
-
-        if not audio_url and info.get('formats'):
-            best = max(
-                (f for f in info['formats'] if f.get('acodec') != 'none'),
-                key=lambda f: f.get('abr') or 0
-            )
-            audio_url = best.get('url')
-            ext = best.get('ext', 'm4a')
-
-        if not audio_url:
-            return jsonify(error='Could not extract audio.'), 422
-
-        title = re.sub(r'[^\w\s\-()]', '', info.get('title', 'recording')).strip()[:80] or 'recording'
-
-        response = jsonify(url=audio_url, filename=f'{title}.{ext}', title=title, ext=ext)
+        safe_title = re.sub(r'[^\w\s\-()]', '', title).strip()[:80] or 'recording'
+        response = jsonify(url=audio_url, filename=f'{safe_title}.{ext}', title=safe_title, ext=ext)
         response.headers['Access-Control-Allow-Origin'] = '*'
         return response, 200
 
