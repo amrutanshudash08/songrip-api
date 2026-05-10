@@ -24,6 +24,25 @@ def clean_url(raw):
     path = path.replace('/sing-recording/', '/recording/')
     return urlunparse(p._replace(path=path, query='', fragment=''))
 
+def try_extract(url, impersonate=None):
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'noplaylist': True,
+        'skip_download': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.smule.com/',
+        },
+    }
+    if impersonate:
+        ydl_opts['impersonate'] = impersonate
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
 @app.route('/')
 def index():
     return jsonify(status='SongRip API is running')
@@ -45,16 +64,19 @@ def rip():
         return jsonify(error='Unsupported platform.'), 400
 
     try:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'noplaylist': True,
-            'skip_download': True,
-            # Impersonate Chrome to bypass Cloudflare
-            'impersonate': 'chrome',
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        # Try with different impersonation targets in order
+        info = None
+        last_error = None
+        for target in [None, 'chrome-124', 'chrome-116', 'safari', 'chrome']:
+            try:
+                info = try_extract(url, impersonate=target)
+                break
+            except Exception as e:
+                last_error = e
+                continue
+
+        if info is None:
+            raise last_error
 
         audio_url = info.get('url')
         ext = info.get('ext', 'm4a')
