@@ -25,13 +25,10 @@ def clean_url(raw):
     return urlunparse(p._replace(path=path, query='', fragment=''))
 
 def find_smule_cdn(text):
-    """Find *.cdn.smule.com audio URLs in any text blob."""
-    # Look for audio CDN URLs (updated pattern per community fix)
     patterns = [
-        r'https://[a-z0-9\-]+\.cdn\.smule\.com/[^\s"\'<>]+\.m4a(?:\?[^\s"\'<>]*)?',
-        r'https://[a-z0-9\-]+\.cdn\.smule\.com/[^\s"\'<>]+\.mp4(?:\?[^\s"\'<>]*)?',
-        r'https://feed\.smule\.com/[^\s"\'<>]+\.m4a(?:\?[^\s"\'<>]*)?',
-        r'https://feed\.smule\.com/[^\s"\'<>]+\.mp4(?:\?[^\s"\'<>]*)?',
+        r'https://[a-z0-9\-]+\.cdn\.smule\.com/[^\s"\'<>\\]+\.m4a(?:\?[^\s"\'<>\\]*)?',
+        r'https://[a-z0-9\-]+\.cdn\.smule\.com/[^\s"\'<>\\]+\.mp4(?:\?[^\s"\'<>\\]*)?',
+        r'https://feed\.smule\.com/[^\s"\'<>\\]+\.m4a(?:\?[^\s"\'<>\\]*)?',
     ]
     for pattern in patterns:
         m = re.search(pattern, text)
@@ -39,35 +36,15 @@ def find_smule_cdn(text):
             return m.group(0).rstrip('\\')
     return None
 
-def try_sownloader_api(url):
-    """Try the old sownloader.com API endpoint — still works for many recordings."""
-    try:
-        resp = requests.get(
-            f'https://sownloader.com/index.php?url={quote(url, safe="")}',
-            headers=HEADERS,
-            timeout=20
-        )
-        if resp.ok and 'cdn.smule.com' in resp.text:
-            audio = find_smule_cdn(resp.text)
-            if audio:
-                # Try to get title from the page
-                title_match = re.search(r'<title>([^<]+)</title>', resp.text, re.I)
-                title = title_match.group(1) if title_match else 'recording'
-                title = re.sub(r'\s*[-|]\s*Sownloader.*$', '', title, flags=re.I).strip()
-                return audio, title
-    except Exception:
-        pass
-    return None, None
-
-def try_playwright(url):
-    """Fallback: use Playwright to render the page and intercept the CDN URL."""
+def extract_smule(url):
     audio_url = None
     title = 'recording'
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+            args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+                  '--autoplay-policy=no-user-gesture-required']
         )
         context = browser.new_context(
             user_agent=HEADERS['User-Agent'],
@@ -75,48 +52,84 @@ def try_playwright(url):
         )
         page = context.new_page()
 
+        # Intercept ALL network responses for CDN audio URLs
         def on_response(response):
             nonlocal audio_url
             u = response.url
-            if not audio_url and 'cdn.smule.com' in u and any(ext in u for ext in ['.m4a', '.mp4']):
-                audio_url = u
-            if not audio_url and 'feed.smule.com' in u and any(ext in u for ext in ['.m4a', '.mp4']):
-                audio_url = u
+            if not audio_url and ('cdn.smule.com' in u or 'feed.smule.com' in u):
+                if any(ext in u for ext in ['.m4a', '.mp4', '.aac']):
+                    audio_url = u
+
+        # Also intercept requests (URL shows up before response)
+        def on_request(req):
+            nonlocal audio_url
+            u = req.url
+            if not audio_url and ('cdn.smule.com' in u or 'feed.smule.com' in u):
+                if any(ext in u for ext in ['.m4a', '.mp4', '.aac']):
+                    audio_url = u
 
         page.on('response', on_response)
+        page.on('request', on_request)
 
         try:
-            page.goto(url, wait_until='commit', timeout=20000)
-            page.wait_for_timeout(5000)
+            page.goto(url, wait_until='domcontentloaded', timeout=25000)
             title = page.title() or 'recording'
 
-            if not audio_url:
-                content = page.content()
-                audio_url = find_smule_cdn(content)
+            # Check __NEXT_DATA__ immediately — audio URL is often SSR'd in
+            content = page.content()
+            audio_url = find_smule_cdn(content)
 
-                # Also check __NEXT_DATA__
-                if not audio_url:
-                    nd = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', content)
-                    if nd:
+            if not audio_url:
+                nd = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', content)
+                if nd:
+                    try:
+                        audio_url = find_smule_cdn(json.dumps(json.loads(nd.group(1))))
+                    except Exception:
+                        pass
+
+            # Try clicking play button to trigger audio load
+            if not audio_url:
+                try:
+                    # Try multiple play button selectors Smule might use
+                    for selector in [
+                        'button[aria-label*="play" i]',
+                        'button[aria-label*="Play" i]',
+                        '[class*="play-btn"]',
+                        '[class*="PlayBtn"]',
+                        '[class*="play_btn"]',
+                        '[class*="player"] button',
+                        'button[class*="play"]',
+                        '[data-testid*="play"]',
+                    ]:
                         try:
-                            audio_url = find_smule_cdn(json.dumps(json.loads(nd.group(1))))
+                            play_btn = page.locator(selector).first
+                            if play_btn.count() > 0:
+                                play_btn.click(timeout=3000)
+                                break
                         except Exception:
-                            pass
+                            continue
+
+                    # Wait for audio CDN request after clicking play
+                    page.wait_for_timeout(6000)
+
+                    if not audio_url:
+                        # Re-check page content after JS executed
+                        content = page.content()
+                        audio_url = find_smule_cdn(content)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            if 'timeout' not in str(e).lower():
+                raise
         finally:
             browser.close()
 
-    return audio_url, title
-
-def extract_smule(url):
-    # Strategy 1: Sownloader API (fast, no Playwright needed)
-    audio_url, title = try_sownloader_api(url)
-
-    # Strategy 2: Playwright fallback
     if not audio_url:
-        audio_url, title = try_playwright(url)
-
-    if not audio_url:
-        raise Exception('Could not extract audio from Smule. The recording may be private.')
+        raise Exception(
+            'Could not extract audio. Smule uses Cloudflare protection that blocks server access. '
+            'Try using the free Sownloader browser extension at sownloader.com instead.'
+        )
 
     ext = 'm4a' if '.m4a' in audio_url else 'mp4'
     safe_title = re.sub(r'[^\w\s\-()]', '', title).strip()[:80] or 'recording'
