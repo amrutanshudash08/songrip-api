@@ -1,19 +1,12 @@
 import os
 import re
+import json
+import requests
 from urllib.parse import urlparse, urlunparse
 from flask import Flask, request, jsonify
-import yt_dlp
-from yt_dlp.networking.impersonate import ImpersonateTarget
+from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
-
-ALLOWED = [
-    "smule.com",
-    "starmakerstudios.com",
-    "starmaker.us",
-    "yokee.com",
-    "singsnap.com",
-]
 
 def clean_url(raw):
     m = re.search(r'https?://\S+', raw)
@@ -24,6 +17,91 @@ def clean_url(raw):
     path = re.sub(r'/(twitter|facebook|instagram|whatsapp|copy|embed|frame|box)(/.*)?$', '', p.path)
     path = path.replace('/sing-recording/', '/recording/')
     return urlunparse(p._replace(path=path, query='', fragment=''))
+
+def extract_smule(url):
+    audio_url = None
+    title = 'recording'
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        )
+        page = context.new_page()
+
+        # Intercept audio CDN responses
+        def on_response(response):
+            nonlocal audio_url
+            u = response.url
+            if any(ext in u for ext in ['.m4a', '.mp4', '.aac', '.mp3']) and not audio_url:
+                audio_url = u
+
+        page.on('response', on_response)
+
+        try:
+            page.goto(url, wait_until='networkidle', timeout=30000)
+            title = page.title() or 'recording'
+
+            # Also dig through page JSON for media_url
+            if not audio_url:
+                content = page.content()
+                next_data = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', content)
+                if next_data:
+                    try:
+                        s = json.dumps(json.loads(next_data.group(1)))
+                        for pattern in [
+                            r'"media_url"\s*:\s*"([^"]+)"',
+                            r'"(https://[^"]+\.(?:m4a|mp4|aac|mp3)(?:\?[^"]*)?)"',
+                        ]:
+                            m = re.search(pattern, s)
+                            if m:
+                                audio_url = m.group(1)
+                                break
+                    except Exception:
+                        pass
+        finally:
+            browser.close()
+
+    if not audio_url:
+        raise Exception('Could not find audio. The recording may be private or unavailable.')
+
+    ext = re.search(r'\.(m4a|mp4|aac|mp3)', audio_url)
+    ext = ext.group(1) if ext else 'm4a'
+    safe_title = re.sub(r'[^\w\s\-()]', '', title).strip()[:80] or 'recording'
+    return audio_url, safe_title, ext
+
+def extract_starmaker(url):
+    p = urlparse(url)
+    params = dict(pair.split('=', 1) for pair in p.query.split('&') if '=' in pair)
+    recording_id = params.get('recordingId')
+    if not recording_id:
+        raise Exception('Could not find recording ID in StarMaker link.')
+
+    resp = requests.get(
+        f'https://www.starmakerstudios.com/api/social/recording/info?recordingId={recording_id}',
+        headers={'User-Agent': 'Mozilla/5.0'},
+        timeout=15
+    )
+    if not resp.ok:
+        raise Exception(f'StarMaker API error ({resp.status_code})')
+
+    data = resp.json()
+    s = json.dumps(data)
+    title = data.get('data', {}).get('recordingName') or data.get('data', {}).get('name') or 'recording'
+    audio_url = data.get('data', {}).get('recordingUrl') or data.get('data', {}).get('audioUrl')
+
+    if not audio_url:
+        m = re.search(r'"(https://[^"]+\.(?:m4a|mp4|aac|mp3)(?:\?[^"]*)?)"', s)
+        if m:
+            audio_url = m.group(1)
+
+    if not audio_url:
+        raise Exception('Could not extract audio from StarMaker.')
+
+    ext = re.search(r'\.(m4a|mp4|aac|mp3)', audio_url)
+    ext = ext.group(1) if ext else 'm4a'
+    safe_title = re.sub(r'[^\w\s\-()]', '', title).strip()[:80] or 'recording'
+    return audio_url, safe_title, ext
 
 @app.route('/')
 def index():
@@ -39,45 +117,22 @@ def rip():
 
     url = clean_url(request.json.get('url', ''))
     if not url:
-        return jsonify(error='No URL found.'), 400
-    if not any(d in url for d in ALLOWED):
-        return jsonify(error='Unsupported platform.'), 400
+        return jsonify(error='No URL found in the text you pasted.'), 400
 
     try:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'noplaylist': True,
-            'skip_download': True,
-            # Auto-pick any available impersonation target (uses curl-cffi)
-            'impersonate': ImpersonateTarget(),
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        audio_url = info.get('url')
-        ext = info.get('ext', 'm4a')
-
-        if not audio_url and info.get('formats'):
-            best = max(
-                (f for f in info['formats'] if f.get('acodec') != 'none'),
-                key=lambda f: f.get('abr') or 0
-            )
-            audio_url = best.get('url')
-            ext = best.get('ext', 'm4a')
-
-        if not audio_url:
-            return jsonify(error='Could not extract audio.'), 422
-
-        title = re.sub(r'[^\w\s\-()]', '', info.get('title', 'recording')).strip()[:80] or 'recording'
+        if 'smule.com' in url:
+            audio_url, title, ext = extract_smule(url)
+        elif 'starmaker' in url:
+            audio_url, title, ext = extract_starmaker(url)
+        else:
+            return jsonify(error='Unsupported platform. Use Smule or StarMaker.'), 400
 
         response = jsonify(url=audio_url, filename=f'{title}.{ext}', title=title, ext=ext)
         response.headers['Access-Control-Allow-Origin'] = '*'
         return response, 200
 
     except Exception as e:
-        response = jsonify(error=str(e)[:300])
+        response = jsonify(error=str(e)[:400])
         response.headers['Access-Control-Allow-Origin'] = '*'
         return response, 422
 
