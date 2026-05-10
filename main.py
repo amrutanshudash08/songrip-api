@@ -2,9 +2,9 @@ import os
 import re
 import json
 import requests
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, parse_qs
 from flask import Flask, request, jsonify
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 app = Flask(__name__)
 
@@ -39,10 +39,18 @@ def extract_smule(url):
         page.on('response', on_response)
 
         try:
-            page.goto(url, wait_until='networkidle', timeout=30000)
+            # Use domcontentloaded instead of networkidle — much faster
+            page.goto(url, wait_until='domcontentloaded', timeout=45000)
+
+            # Wait a bit for audio requests to fire
+            try:
+                page.wait_for_timeout(5000)
+            except Exception:
+                pass
+
             title = page.title() or 'recording'
 
-            # Also dig through page JSON for media_url
+            # Dig through __NEXT_DATA__ for media_url
             if not audio_url:
                 content = page.content()
                 next_data = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', content)
@@ -51,6 +59,7 @@ def extract_smule(url):
                         s = json.dumps(json.loads(next_data.group(1)))
                         for pattern in [
                             r'"media_url"\s*:\s*"([^"]+)"',
+                            r'"(https://[^"]+smule[^"]+\.(?:m4a|mp4|aac|mp3)(?:\?[^"]*)?)"',
                             r'"(https://[^"]+\.(?:m4a|mp4|aac|mp3)(?:\?[^"]*)?)"',
                         ]:
                             m = re.search(pattern, s)
@@ -59,6 +68,14 @@ def extract_smule(url):
                                 break
                     except Exception:
                         pass
+
+            # Also check og:audio in page source
+            if not audio_url:
+                content = page.content()
+                og = re.search(r'property="og:audio(?::url)?"\s+content="([^"]+)"', content)
+                if og:
+                    audio_url = og.group(1)
+
         finally:
             browser.close()
 
@@ -71,20 +88,29 @@ def extract_smule(url):
     return audio_url, safe_title, ext
 
 def extract_starmaker(url):
-    # Use URLSearchParams-style parsing to handle complex query strings
     parsed = urlparse(url)
-    # Handle both ? and & separated params
-    from urllib.parse import parse_qs
     params = parse_qs(parsed.query)
     recording_id = (params.get('recordingId') or [''])[0]
-    
+
     if not recording_id:
         raise Exception('Could not find recording ID in StarMaker link.')
+
+    resp = requests.get(
+        f'https://www.starmakerstudios.com/api/social/recording/info?recordingId={recording_id}',
+        headers={'User-Agent': 'Mozilla/5.0'},
+        timeout=15
+    )
+    if not resp.ok:
+        raise Exception(f'StarMaker API error ({resp.status_code})')
 
     data = resp.json()
     s = json.dumps(data)
     title = data.get('data', {}).get('recordingName') or data.get('data', {}).get('name') or 'recording'
-    audio_url = data.get('data', {}).get('recordingUrl') or data.get('data', {}).get('audioUrl')
+    audio_url = (
+        data.get('data', {}).get('recordingUrl') or
+        data.get('data', {}).get('audioUrl') or
+        data.get('data', {}).get('mediaUrl')
+    )
 
     if not audio_url:
         m = re.search(r'"(https://[^"]+\.(?:m4a|mp4|aac|mp3)(?:\?[^"]*)?)"', s)
