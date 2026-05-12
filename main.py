@@ -24,7 +24,6 @@ def find_smule_cdn(text):
         r'https://[a-z0-9\-]+\.cdn\.smule\.com/[^\s"\'<>\\]+\.m4a(?:\?[^\s"\'<>\\]*)?',
         r'https://[a-z0-9\-]+\.cdn\.smule\.com/[^\s"\'<>\\]+\.mp4(?:\?[^\s"\'<>\\]*)?',
         r'https://feed\.smule\.com/[^\s"\'<>\\]+\.m4a(?:\?[^\s"\'<>\\]*)?',
-        r'https://feed\.smule\.com/[^\s"\'<>\\]+\.mp4(?:\?[^\s"\'<>\\]*)?',
     ]
     for pattern in patterns:
         m = re.search(pattern, text)
@@ -32,37 +31,74 @@ def find_smule_cdn(text):
             return m.group(0).rstrip('\\')
     return None
 
+def scrape(url, render=False, ultra=False):
+    params = {
+        'api_key': SCRAPER_API_KEY,
+        'url': url,
+        'premium': 'true',
+    }
+    if render:
+        params['render'] = 'true'
+    if ultra:
+        params['ultra_premium'] = 'true'
+    resp = requests.get('http://api.scraperapi.com', params=params, timeout=60)
+    return resp
+
 def extract_smule(url):
     if not SCRAPER_API_KEY:
         raise Exception('SCRAPER_API_KEY not set. Add it in Railway Variables.')
 
-    # Use ScraperAPI with JS rendering to bypass Cloudflare
-    resp = requests.get(
-        'http://api.scraperapi.com',
-        params={
-            'api_key': SCRAPER_API_KEY,
-            'url': url,
-            'render': 'true',      # full JS rendering
-            'premium': 'true',     # residential IPs for Cloudflare
-        },
-        timeout=60
-    )
+    # Also try the short URL format which may be less protected
+    key_match = re.search(r'(\d+_\d+)', url)
+    short_url = f'https://www.smule.com/recording/p/{key_match.group(1)}' if key_match else None
 
-    if not resp.ok:
-        raise Exception(f'ScraperAPI error ({resp.status_code}). Check your API key.')
-
-    html = resp.text
-
-    # Get title
+    html = None
     title = 'recording'
+
+    # Strategy 1: plain fetch (no JS render) — sometimes bypasses CF better
+    for attempt_url in [url, short_url]:
+        if not attempt_url:
+            continue
+        try:
+            resp = scrape(attempt_url, render=False, ultra=False)
+            if resp.ok and 'cdn.smule.com' in resp.text:
+                html = resp.text
+                break
+            elif resp.ok and 'smule' in resp.text.lower() and 'cloudflare' not in resp.text.lower():
+                html = resp.text
+                break
+        except Exception:
+            continue
+
+    # Strategy 2: ultra premium no render
+    if not html:
+        try:
+            resp = scrape(url, render=False, ultra=True)
+            if resp.ok and len(resp.text) > 5000:
+                html = resp.text
+        except Exception:
+            pass
+
+    # Strategy 3: render=true + ultra premium
+    if not html:
+        try:
+            resp = scrape(url, render=True, ultra=True)
+            if resp.ok and len(resp.text) > 5000:
+                html = resp.text
+        except Exception:
+            pass
+
+    if not html:
+        raise Exception('ScraperAPI could not bypass Smule\'s Cloudflare protection. Try sownloader.com for now.')
+
+    # Extract title
     og_title = re.search(r'property="og:title"\s+content="([^"]+)"', html)
     if og_title:
         title = og_title.group(1)
 
-    # Find audio CDN URL
+    # Find audio URL
     audio_url = find_smule_cdn(html)
 
-    # Check __NEXT_DATA__
     if not audio_url:
         nd = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', html)
         if nd:
@@ -72,9 +108,11 @@ def extract_smule(url):
                 pass
 
     if not audio_url:
-        # Log what we got for debugging
-        preview = html[:300] if html else 'empty'
-        raise Exception(f'Could not find audio URL. Page preview: {preview}')
+        # Check if we got the actual page or a challenge
+        is_challenge = any(x in html for x in ['cf-browser-verification', 'checking your browser', 'enable javascript', 'cf_chl'])
+        if is_challenge:
+            raise Exception('Cloudflare blocked the request. Smule is heavily protected — try sownloader.com for Smule recordings.')
+        raise Exception('Got the page but could not find audio URL. The recording may be private or deleted.')
 
     ext = 'm4a' if '.m4a' in audio_url else 'mp4'
     safe_title = re.sub(r'[^\w\s\-()]', '', title).strip()[:80] or 'recording'
