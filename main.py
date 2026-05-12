@@ -1,13 +1,13 @@
 import os
 import re
 import json
-import asyncio
 import requests
-import nodriver as uc
 from urllib.parse import urlparse, urlunparse, parse_qs
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+
+SCRAPER_API_KEY = os.environ.get('SCRAPER_API_KEY', '')
 
 def clean_url(raw):
     m = re.search(r'https?://\S+', raw)
@@ -32,103 +32,49 @@ def find_smule_cdn(text):
             return m.group(0).rstrip('\\')
     return None
 
-async def extract_smule_async(url):
-    audio_url = None
-    title = 'recording'
+def extract_smule(url):
+    if not SCRAPER_API_KEY:
+        raise Exception('SCRAPER_API_KEY not set. Add it in Railway Variables.')
 
-    browser = await uc.start(
-        headless=True,
-        browser_executable_path='/usr/bin/google-chrome',
-        browser_args=[
-            '--no-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--autoplay-policy=no-user-gesture-required',
-        ]
+    # Use ScraperAPI with JS rendering to bypass Cloudflare
+    resp = requests.get(
+        'http://api.scraperapi.com',
+        params={
+            'api_key': SCRAPER_API_KEY,
+            'url': url,
+            'render': 'true',      # full JS rendering
+            'premium': 'true',     # residential IPs for Cloudflare
+        },
+        timeout=60
     )
 
-    try:
-        tab = await browser.get(url)
+    if not resp.ok:
+        raise Exception(f'ScraperAPI error ({resp.status_code}). Check your API key.')
 
-        # Wait for page to fully load and JS to execute
-        await asyncio.sleep(6)
+    html = resp.text
 
-        # Get page title
-        title = await tab.evaluate('document.title') or 'recording'
+    # Get title
+    title = 'recording'
+    og_title = re.search(r'property="og:title"\s+content="([^"]+)"', html)
+    if og_title:
+        title = og_title.group(1)
 
-        # Get full page HTML
-        content = await tab.get_content()
+    # Find audio CDN URL
+    audio_url = find_smule_cdn(html)
 
-        # Check for audio CDN URL in page HTML
-        audio_url = find_smule_cdn(content)
-
-        # Check __NEXT_DATA__
-        if not audio_url:
+    # Check __NEXT_DATA__
+    if not audio_url:
+        nd = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', html)
+        if nd:
             try:
-                nd = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', content)
-                if nd:
-                    audio_url = find_smule_cdn(json.dumps(json.loads(nd.group(1))))
+                audio_url = find_smule_cdn(json.dumps(json.loads(nd.group(1))))
             except Exception:
                 pass
-
-        # Try clicking play button
-        if not audio_url:
-            for selector in [
-                'button[aria-label*="play" i]',
-                'button[aria-label*="Play" i]',
-                '[class*="play-btn"]',
-                '[class*="PlayBtn"]',
-                '[class*="player"] button',
-                'button[class*="play"]',
-            ]:
-                try:
-                    el = await tab.find(selector, timeout=2)
-                    if el:
-                        await el.click()
-                        await asyncio.sleep(4)
-                        content = await tab.get_content()
-                        audio_url = find_smule_cdn(content)
-                        if audio_url:
-                            break
-                except Exception:
-                    continue
-
-        # Also check network requests via JS
-        if not audio_url:
-            try:
-                result = await tab.evaluate('''
-                    (() => {
-                        const entries = performance.getEntriesByType("resource");
-                        for (const e of entries) {
-                            if ((e.name.includes("cdn.smule.com") || e.name.includes("feed.smule.com"))
-                                && (e.name.includes(".m4a") || e.name.includes(".mp4"))) {
-                                return e.name;
-                            }
-                        }
-                        return null;
-                    })()
-                ''')
-                if result:
-                    audio_url = result
-            except Exception:
-                pass
-
-    finally:
-        browser.stop()
-
-    return audio_url, title
-
-def extract_smule(url):
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        audio_url, title = loop.run_until_complete(extract_smule_async(url))
-        loop.close()
-    except Exception as e:
-        raise Exception(f'Browser error: {str(e)[:200]}')
 
     if not audio_url:
-        raise Exception('Could not extract audio from Smule. The recording may be private or unavailable.')
+        # Log what we got for debugging
+        preview = html[:300] if html else 'empty'
+        raise Exception(f'Could not find audio URL. Page preview: {preview}')
 
     ext = 'm4a' if '.m4a' in audio_url else 'mp4'
     safe_title = re.sub(r'[^\w\s\-()]', '', title).strip()[:80] or 'recording'
